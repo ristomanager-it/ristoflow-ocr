@@ -24,7 +24,7 @@ app.post("/ocr", async (req, res) => {
     const response = await openai.responses.create({
       model: "gpt-4o",
       temperature: 0,
-      max_output_tokens: 1200,
+      max_output_tokens: 800,
       input: [
         {
           role: "user",
@@ -34,10 +34,10 @@ app.post("/ocr", async (req, res) => {
               text: `
 Analizza questa fattura italiana.
 
-Restituisci ESCLUSIVAMENTE JSON valido.
-Non scrivere testo fuori dal JSON.
+Restituisci SOLO JSON valido.
+Nessun testo fuori dal JSON.
 
-Struttura obbligatoria:
+Struttura:
 
 {
   "documento": {
@@ -60,16 +60,13 @@ Struttura obbligatoria:
   ]
 }
 
-Regole obbligatorie:
-
-- Considera SOLO le righe prodotti.
-- Ignora totali documento, imponibile, riepiloghi IVA.
+Regole:
+- Solo righe prodotto.
+- Ignora totali generali.
 - Non unire righe.
 - Non inventare prodotti.
-- Se trovi numeri come "3 564" interpretali come 3564.
 - Usa punto come separatore decimale.
-- Se quantità e totale_riga sono presenti, ricostruisci prezzo_unitario.
-- Non inserire righe senza descrizione reale.
+- Se quantità e totale_riga esistono, calcola prezzo_unitario.
 `
             },
             {
@@ -90,10 +87,19 @@ Regole obbligatorie:
       });
     }
 
+    // 🔥 PULIZIA AUTOMATICA MARKDOWN
+    let cleaned = text.trim();
+
+    if (cleaned.startsWith("```")) {
+      cleaned = cleaned.replace(/```json/gi, "");
+      cleaned = cleaned.replace(/```/g, "");
+      cleaned = cleaned.trim();
+    }
+
     let parsed;
 
     try {
-      parsed = JSON.parse(text);
+      parsed = JSON.parse(cleaned);
     } catch (e) {
       return res.status(500).json({
         success: false,
