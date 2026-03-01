@@ -1,16 +1,15 @@
 import express from "express";
 import OpenAI from "openai";
 import cors from "cors";
-import axios from "axios";
-import fs from "fs";
-import path from "path";
-import { fileTypeFromBuffer } from "file-type";
-import pdf from "pdf-poppler";
+
+/* ========================= */
+/* ===== APP INIT ========== */
+/* ========================= */
 
 const app = express();
 
 /* ========================= */
-/* ===== CORS DEFINITIVO ==== */
+/* ===== CORS FIX ========= */
 /* ========================= */
 
 app.use(cors({
@@ -42,51 +41,10 @@ const openai = new OpenAI({
 });
 
 /* ========================= */
-/* ===== TEMP DIR ========= */
+/* ===== OCR ENGINE ======== */
 /* ========================= */
 
-const TEMP_DIR = "./tmp";
-if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR);
-
-/* ========================= */
-/* ===== UTILITIES ========= */
-/* ========================= */
-
-async function downloadFile(url) {
-  const response = await axios.get(url, { responseType: "arraybuffer" });
-  return Buffer.from(response.data);
-}
-
-async function convertPdfToImages(buffer) {
-  const fileId = Date.now();
-  const pdfPath = path.join(TEMP_DIR, `input_${fileId}.pdf`);
-  fs.writeFileSync(pdfPath, buffer);
-
-  const outputDir = path.join(TEMP_DIR, `out_${fileId}`);
-  if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir);
-
-  const options = {
-    format: "png",
-    out_dir: outputDir,
-    out_prefix: "page",
-    page: null
-  };
-
-  await pdf.convert(pdfPath, options);
-
-  const files = fs.readdirSync(outputDir);
-  return files.map(f => path.join(outputDir, f));
-}
-
-async function runVision(imagePathOrUrl) {
-  const imageInput =
-    imagePathOrUrl.startsWith("http")
-      ? { type: "input_image", image_url: imagePathOrUrl }
-      : {
-          type: "input_image",
-          image_base64: fs.readFileSync(imagePathOrUrl, { encoding: "base64" })
-        };
-
+async function runVision(imageUrl) {
   const response = await openai.responses.create({
     model: "gpt-4o",
     temperature: 0,
@@ -126,7 +84,10 @@ Struttura:
 }
 `
           },
-          imageInput
+          {
+            type: "input_image",
+            image_url: imageUrl
+          }
         ]
       }
     ]
@@ -138,11 +99,21 @@ Struttura:
   let cleaned = text.trim();
   cleaned = cleaned.replace(/```json/gi, "").replace(/```/g, "").trim();
 
-  return JSON.parse(cleaned);
+  try {
+    return JSON.parse(cleaned);
+  } catch (e) {
+    console.error("JSON non valido:", cleaned);
+    throw new Error("JSON non valido restituito dal modello");
+  }
 }
+
+/* ========================= */
+/* ===== DEDUP ============= */
+/* ========================= */
 
 function dedupeRighe(righe = []) {
   const seen = new Set();
+
   return righe.filter(r => {
     const key = `${(r.descrizione || "").trim().toLowerCase()}_${r.quantita}_${r.prezzo_unitario}`;
     if (seen.has(key)) return false;
@@ -175,23 +146,9 @@ app.post("/ocr", async (req, res) => {
     let results = [];
 
     for (const url of urls) {
-      const buffer = await downloadFile(url);
-      const type = await fileTypeFromBuffer(buffer);
-
-      if (type?.mime === "application/pdf") {
-        const images = await convertPdfToImages(buffer);
-
-        for (const img of images) {
-          const parsed = await runVision(img);
-          results.push(parsed);
-        }
-      } else {
-        const parsed = await runVision(url);
-        results.push(parsed);
-      }
+      const parsed = await runVision(url);
+      results.push(parsed);
     }
-
-    /* ===== Merge multipagina / multifile ===== */
 
     const final = {
       documento: results[0]?.documento ?? null,
@@ -217,13 +174,13 @@ app.post("/ocr", async (req, res) => {
 
     res.status(500).json({
       success: false,
-      error: "Errore OCR server"
+      error: err.message || "Errore OCR server"
     });
   }
 });
 
 /* ========================= */
-/* ===== SERVER START ====== */
+/* ===== START SERVER ====== */
 /* ========================= */
 
 const PORT = process.env.PORT || 3000;
