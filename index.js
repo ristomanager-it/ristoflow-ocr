@@ -8,15 +8,49 @@ import { fileTypeFromBuffer } from "file-type";
 import pdf from "pdf-poppler";
 
 const app = express();
-app.use(cors());
-app.use(express.json({ limit: "10mb" }));
+
+/* ========================= */
+/* ===== CORS DEFINITIVO ==== */
+/* ========================= */
+
+app.use(cors({
+  origin: "*",
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"]
+}));
+
+app.options("*", cors());
+
+app.use(express.json({ limit: "20mb" }));
+
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type,Authorization");
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(200);
+  }
+  next();
+});
+
+/* ========================= */
+/* ===== OPENAI INIT ======= */
+/* ========================= */
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
 });
 
+/* ========================= */
+/* ===== TEMP DIR ========= */
+/* ========================= */
+
 const TEMP_DIR = "./tmp";
 if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR);
+
+/* ========================= */
+/* ===== UTILITIES ========= */
+/* ========================= */
 
 async function downloadFile(url) {
   const response = await axios.get(url, { responseType: "arraybuffer" });
@@ -29,7 +63,7 @@ async function convertPdfToImages(buffer) {
   fs.writeFileSync(pdfPath, buffer);
 
   const outputDir = path.join(TEMP_DIR, `out_${fileId}`);
-  fs.mkdirSync(outputDir);
+  if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir);
 
   const options = {
     format: "png",
@@ -56,7 +90,7 @@ async function runVision(imagePathOrUrl) {
   const response = await openai.responses.create({
     model: "gpt-4o",
     temperature: 0,
-    max_output_tokens: 800,
+    max_output_tokens: 1200,
     input: [
       {
         role: "user",
@@ -67,11 +101,18 @@ async function runVision(imagePathOrUrl) {
 Analizza questa fattura italiana.
 
 Restituisci SOLO JSON valido.
+Nessun testo fuori dal JSON.
 
 Struttura:
 {
-  "documento": { "numero_documento": string|null, "data_documento": string|null },
-  "fornitore": { "ragione_sociale": string|null, "piva": string|null },
+  "documento": {
+    "numero_documento": string|null,
+    "data_documento": string|null
+  },
+  "fornitore": {
+    "ragione_sociale": string|null,
+    "piva": string|null
+  },
   "righe": [
     {
       "descrizione": string,
@@ -100,30 +141,58 @@ Struttura:
   return JSON.parse(cleaned);
 }
 
+function dedupeRighe(righe = []) {
+  const seen = new Set();
+  return righe.filter(r => {
+    const key = `${(r.descrizione || "").trim().toLowerCase()}_${r.quantita}_${r.prezzo_unitario}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+/* ========================= */
+/* ===== OCR ROUTE ========= */
+/* ========================= */
+
 app.post("/ocr", async (req, res) => {
   try {
-    const { imageUrl } = req.body;
-    if (!imageUrl) {
-      return res.status(400).json({ success: false, error: "imageUrl mancante" });
-    }
+    const { imageUrl, imageUrls } = req.body;
 
-    const buffer = await downloadFile(imageUrl);
-    const type = await fileTypeFromBuffer(buffer);
+    const urls = Array.isArray(imageUrls)
+      ? imageUrls
+      : imageUrl
+        ? [imageUrl]
+        : [];
+
+    if (!urls.length) {
+      return res.status(400).json({
+        success: false,
+        error: "imageUrl o imageUrls mancanti"
+      });
+    }
 
     let results = [];
 
-    if (type?.mime === "application/pdf") {
-      const images = await convertPdfToImages(buffer);
-      for (const img of images) {
-        const parsed = await runVision(img);
+    for (const url of urls) {
+      const buffer = await downloadFile(url);
+      const type = await fileTypeFromBuffer(buffer);
+
+      if (type?.mime === "application/pdf") {
+        const images = await convertPdfToImages(buffer);
+
+        for (const img of images) {
+          const parsed = await runVision(img);
+          results.push(parsed);
+        }
+      } else {
+        const parsed = await runVision(url);
         results.push(parsed);
       }
-    } else {
-      const parsed = await runVision(imageUrl);
-      results.push(parsed);
     }
 
-    // 🔥 Merge multipagina
+    /* ===== Merge multipagina / multifile ===== */
+
     const final = {
       documento: results[0]?.documento ?? null,
       fornitore: results[0]?.fornitore ?? null,
@@ -131,29 +200,34 @@ app.post("/ocr", async (req, res) => {
     };
 
     for (const r of results) {
-      if (Array.isArray(r.righe)) {
+      if (Array.isArray(r?.righe)) {
         final.righe.push(...r.righe);
       }
     }
 
-    // Dedup semplice
-    const seen = new Set();
-    final.righe = final.righe.filter(r => {
-      const key = `${r.descrizione}_${r.quantita}_${r.prezzo_unitario}`;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
+    final.righe = dedupeRighe(final.righe);
 
-    res.json({ success: true, ...final });
+    res.json({
+      success: true,
+      ...final
+    });
 
   } catch (err) {
     console.error("Errore OCR:", err);
-    res.status(500).json({ success: false, error: "Errore OCR server" });
+
+    res.status(500).json({
+      success: false,
+      error: "Errore OCR server"
+    });
   }
 });
 
+/* ========================= */
+/* ===== SERVER START ====== */
+/* ========================= */
+
 const PORT = process.env.PORT || 3000;
+
 app.listen(PORT, () => {
   console.log("OCR server avviato su porta " + PORT);
 });
